@@ -6,6 +6,16 @@
 
 import { definePluginSettings } from "@api/Settings";
 import definePlugin, { OptionType } from "@utils/types";
+import { onceReady } from "@webpack";
+import {
+    ApplicationStreamingStore,
+    ChannelStore,
+    FluxDispatcher,
+    GuildChannelStore,
+    QuestStore,
+    RestAPI,
+    RunningGameStore,
+} from "@webpack/common";
 
 const settings = definePluginSettings({
     autoAcceptQuests: {
@@ -24,24 +34,12 @@ const settings = definePluginSettings({
 
 const SUPPORTED_TASKS = ["WATCH_VIDEO", "PLAY_ON_DESKTOP", "STREAM_ON_DESKTOP", "PLAY_ACTIVITY", "WATCH_VIDEO_ON_MOBILE"];
 
-// ── Store references ──────────────────────────────────────────────────────────
-let ApplicationStreamingStore: any;
-let RunningGameStore: any;
-let QuestsStore: any;
-let ChannelStore: any;
-let GuildChannelStore: any;
-let FluxDispatcher: any;
-let api: any;
 let isApp: boolean;
-
-// ── Runtime state ─────────────────────────────────────────────────────────────
-let initialized = false;
 let questQueue: any[] = [];
 let pollInterval: ReturnType<typeof setInterval> | null = null;
 let fluxUnsubs: (() => void)[] = [];
 let sessionStarting = false;
 
-// ── Utility ───────────────────────────────────────────────────────────────────
 const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
 
 function log(...args: any[]) {
@@ -69,73 +67,20 @@ function isCompleted(quest: any): boolean {
     return !!quest.userStatus?.completedAt;
 }
 
-// ── Store init ────────────────────────────────────────────────────────────────
-function initStores(): boolean {
-    if (initialized) return true;
-
-    try {
-        if (!(window as any).webpackChunkdiscord_app) return false;
-        let wpRequire: any = null;
-        (window as any).webpackChunkdiscord_app.push([[Symbol()], {}, (r: any) => { wpRequire = r; }]);
-        (window as any).webpackChunkdiscord_app.pop();
-
-        if (!wpRequire?.c) return false;
-
-        const modules = Object.values(wpRequire.c);
-
-        ApplicationStreamingStore = modules.find((x: any) =>
-            x?.exports?.Z?.__proto__?.getStreamerActiveStreamMetadata ||
-            x?.exports?.default?.__proto__?.getStreamerActiveStreamMetadata
-        )?.exports?.Z ?? modules.find((x: any) =>
-            x?.exports?.A?.__proto__?.getStreamerActiveStreamMetadata
-        )?.exports?.A;
-
-        RunningGameStore = modules.find((x: any) => x?.exports?.Ay?.getRunningGames)?.exports?.Ay ??
-                           modules.find((x: any) => x?.exports?.ZP?.getRunningGames)?.exports?.ZP ??
-                           modules.find((x: any) => x?.exports?.Z?.getRunningGames)?.exports?.Z;
-
-        QuestsStore = modules.find((x: any) => x?.exports?.A?.__proto__?.getQuest)?.exports?.A ??
-                      modules.find((x: any) => x?.exports?.Z?.__proto__?.getQuest)?.exports?.Z ??
-                      modules.find((x: any) => x?.exports?.default?.__proto__?.getQuest)?.exports?.default;
-
-        ChannelStore = modules.find((x: any) => x?.exports?.A?.__proto__?.getAllThreadsForParent)?.exports?.A ??
-                       modules.find((x: any) => x?.exports?.Z?.__proto__?.getAllThreadsForParent)?.exports?.Z ??
-                       modules.find((x: any) => x?.exports?.default?.__proto__?.getAllThreadsForParent)?.exports?.default;
-
-        GuildChannelStore = modules.find((x: any) => x?.exports?.Ay?.getSFWDefaultChannel)?.exports?.Ay ??
-                            modules.find((x: any) => x?.exports?.ZP?.getSFWDefaultChannel)?.exports?.ZP;
-
-        FluxDispatcher = modules.find((x: any) => x?.exports?.h?.__proto__?.flushWaitQueue)?.exports?.h ??
-                         modules.find((x: any) => x?.exports?.Z?.__proto__?.flushWaitQueue)?.exports?.Z ??
-                         modules.find((x: any) => x?.exports?.default?.__proto__?.flushWaitQueue)?.exports?.default;
-
-        api = modules.find((x: any) => x?.exports?.Bo?.get)?.exports?.Bo ??
-              modules.find((x: any) => x?.exports?.tn?.get)?.exports?.tn ??
-              modules.find((x: any) => x?.exports?.HTTP?.get)?.exports?.HTTP;
-
-        if (!QuestsStore || !FluxDispatcher || !api) {
-            console.error("[QuestAutoCompleterV2] Failed to find required stores");
-            return false;
-        }
-
-        isApp = typeof (window as any).DiscordNative !== "undefined";
-        initialized = true;
-        log("Stores initialized, isApp =", isApp);
-        return true;
-    } catch (e) {
-        console.error("[QuestAutoCompleterV2] Init failed:", e);
-        return false;
-    }
+function storesReady(): boolean {
+    if (!QuestStore) { log("QuestStore not ready yet"); return false; }
+    if (!FluxDispatcher) { log("FluxDispatcher not ready yet"); return false; }
+    if (!RestAPI) { log("RestAPI not ready yet"); return false; }
+    return true;
 }
 
-// ── Auto-accept ───────────────────────────────────────────────────────────────
 async function enrollQuest(quest: any): Promise<boolean> {
     const name = quest.config.messages.questName;
     const MAX_RETRIES = 3;
 
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
         try {
-            const res = await api.post({
+            const res = await RestAPI.post({
                 url: `/quests/${quest.id}/enroll`,
                 body: {
                     location: 11,
@@ -158,7 +103,7 @@ async function enrollQuest(quest: any): Promise<boolean> {
 
         } catch (e: any) {
             const status: number = e?.status ?? e?.res?.status ?? 0;
-            const body: any      = e?.body   ?? e?.res?.body   ?? {};
+            const body: any = e?.body ?? e?.res?.body ?? {};
 
             if (status === 429) {
                 const waitMs = ((body?.retry_after ?? 5) + 1) * 1000;
@@ -178,9 +123,9 @@ async function enrollQuest(quest: any): Promise<boolean> {
 
 async function autoAcceptAvailableQuests(): Promise<boolean> {
     if (!settings.store.autoAcceptQuests) return false;
-    if (!QuestsStore?.quests) return false;
+    if (!QuestStore?.quests) return false;
 
-    const unaccepted = [...QuestsStore.quests.values()].filter(q =>
+    const unaccepted = [...QuestStore.quests.values()].filter((q: any) =>
         !isEnrolled(q) && !isCompleted(q) && isCompletable(q)
     );
 
@@ -198,12 +143,11 @@ async function autoAcceptAvailableQuests(): Promise<boolean> {
     return enrolledAny;
 }
 
-// ── Concurrent quest management ─────────────────────────────────────────────────────
 const activeQuestIds = new Set<string>();
 
 function launchEligibleQuests() {
-    if (!QuestsStore?.quests) return;
-    const enrolled = [...QuestsStore.quests.values()].filter(q =>
+    if (!QuestStore?.quests) return;
+    const enrolled = [...QuestStore.quests.values()].filter((q: any) =>
         isEnrolled(q) && !isCompleted(q) && isCompletable(q)
     );
 
@@ -216,19 +160,17 @@ function launchEligibleQuests() {
 }
 
 async function scan() {
-    if (!initialized) return;
+    if (!storesReady()) return;
     const newlyEnrolled = await autoAcceptAvailableQuests();
     if (newlyEnrolled) await sleep(500);
     launchEligibleQuests();
 }
 
-// ── Session init ──────────────────────────────────────────────────────────────
 function startSession() {
     if (sessionStarting) return;
     sessionStarting = true;
 
-    initialized      = false;
-    questQueue       = [];
+    questQueue = [];
     activeQuestIds.clear();
 
     if (pollInterval !== null) {
@@ -236,13 +178,20 @@ function startSession() {
         pollInterval = null;
     }
 
-    setTimeout(async () => {
+    onceReady.then(async () => {
         sessionStarting = false;
-        if (!initStores()) return;
+
+        if (!storesReady()) {
+            console.error("[QuestAutoCompleterV2] Stores unexpectedly missing after onceReady – aborting session");
+            return;
+        }
+
+        isApp = typeof (window as any).DiscordNative !== "undefined";
+        log("Stores ready, isApp =", isApp);
 
         try {
             log("Fetching quests from API...");
-            await api.get({ url: "/quests/@me" });
+            await RestAPI.get({ url: "/quests/@me" });
             log("Quest data loaded");
         } catch (e) {
             log("Could not pre-fetch quests (will retry on next poll):", e);
@@ -250,22 +199,19 @@ function startSession() {
 
         pollInterval = setInterval(() => scan(), 60_000);
         scan();
-    }, 2000);
+    });
 }
 
-// ── Processing loop ───────────────────────────────────────────────────────────
 function doJob(quest: any) {
-
-    const pid             = Math.floor(Math.random() * 30000) + 1000;
-    const applicationId   = quest.config.application.id;
+    const pid = Math.floor(Math.random() * 30000) + 1000;
+    const applicationId = quest.config.application.id;
     const applicationName = quest.config.application.name;
-    const questName       = quest.config.messages.questName;
-    const taskConfig      = getTaskConfig(quest);
-    const taskName        = SUPPORTED_TASKS.find(x => taskConfig.tasks[x] != null)!;
-    const secondsNeeded   = taskConfig.tasks[taskName].target;
-    let secondsDone       = quest.userStatus?.progress?.[taskName]?.value ?? 0;
+    const questName = quest.config.messages.questName;
+    const taskConfig = getTaskConfig(quest);
+    const taskName = SUPPORTED_TASKS.find(x => taskConfig.tasks[x] != null)!;
+    const secondsNeeded = taskConfig.tasks[taskName].target;
+    let secondsDone = quest.userStatus?.progress?.[taskName]?.value ?? 0;
 
-    // ── WATCH_VIDEO / WATCH_VIDEO_ON_MOBILE ───────────────────────────────────
     if (taskName === "WATCH_VIDEO" || taskName === "WATCH_VIDEO_ON_MOBILE") {
         const maxFuture = 10, speed = 7, interval = 1;
         const enrolledAt = new Date(quest.userStatus.enrolledAt).getTime();
@@ -279,7 +225,7 @@ function doJob(quest: any) {
                     const timestamp = secondsDone + speed;
 
                     if (diff >= speed) {
-                        const res = await api.post({
+                        const res = await RestAPI.post({
                             url: `/quests/${quest.id}/video-progress`,
                             body: { timestamp: Math.min(secondsNeeded, timestamp + Math.random()) }
                         });
@@ -292,7 +238,7 @@ function doJob(quest: any) {
                 }
 
                 if (!completed) {
-                    await api.post({
+                    await RestAPI.post({
                         url: `/quests/${quest.id}/video-progress`,
                         body: { timestamp: secondsNeeded }
                     });
@@ -307,7 +253,6 @@ function doJob(quest: any) {
 
         log(`Spoofing video: ${questName}`);
 
-    // ── PLAY_ON_DESKTOP ───────────────────────────────────────────────────────
     } else if (taskName === "PLAY_ON_DESKTOP") {
         if (!isApp) {
             log(`${questName} requires the desktop app – skipping`);
@@ -315,7 +260,7 @@ function doJob(quest: any) {
             return;
         }
 
-        api.get({ url: `/applications/public?application_ids=${applicationId}` })
+        RestAPI.get({ url: `/applications/public?application_ids=${applicationId}` })
             .then((res: any) => {
                 const appData = res.body?.[0];
 
@@ -326,8 +271,8 @@ function doJob(quest: any) {
                 }
 
                 const win32Exe = appData.executables?.find((x: any) => x.os === "win32");
-                const anyExe   = appData.executables?.[0];
-                const exeName  = (win32Exe ?? anyExe)?.name?.replace(">", "") ?? `${appData.name}.exe`;
+                const anyExe = appData.executables?.[0];
+                const exeName = (win32Exe ?? anyExe)?.name?.replace(">", "") ?? `${appData.name}.exe`;
 
                 const fakeGame = {
                     cmdLine: `C:\\Program Files\\${appData.name}\\${exeName}`,
@@ -343,19 +288,19 @@ function doJob(quest: any) {
                     start: Date.now(),
                 };
 
-                const realGames           = RunningGameStore.getRunningGames();
+                const realGames = RunningGameStore.getRunningGames();
                 const realGetRunningGames = RunningGameStore.getRunningGames;
-                const realGetGameForPID   = RunningGameStore.getGameForPID;
+                const realGetGameForPID = RunningGameStore.getGameForPID;
 
                 const cleanup = () => {
                     RunningGameStore.getRunningGames = realGetRunningGames;
-                    RunningGameStore.getGameForPID   = realGetGameForPID;
+                    RunningGameStore.getGameForPID = realGetGameForPID;
                     FluxDispatcher.dispatch({ type: "RUNNING_GAMES_CHANGE", removed: [fakeGame], added: [], games: [] });
                     FluxDispatcher.unsubscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", fn);
                 };
 
                 RunningGameStore.getRunningGames = () => [fakeGame];
-                RunningGameStore.getGameForPID   = (p: number) => (p === fakeGame.pid ? fakeGame : undefined);
+                RunningGameStore.getGameForPID = (p: number) => (p === fakeGame.pid ? fakeGame : undefined);
                 FluxDispatcher.dispatch({ type: "RUNNING_GAMES_CHANGE", removed: realGames, added: [fakeGame], games: [fakeGame] });
 
                 const fn = (data: any) => {
@@ -386,7 +331,6 @@ function doJob(quest: any) {
                 activeQuestIds.delete(quest.id);
             });
 
-    // ── STREAM_ON_DESKTOP ─────────────────────────────────────────────────────
     } else if (taskName === "STREAM_ON_DESKTOP") {
         if (!isApp) {
             log(`${questName} requires the desktop app – skipping`);
@@ -430,7 +374,6 @@ function doJob(quest: any) {
         FluxDispatcher.subscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", fn);
         log(`Spoofed stream: ${applicationName} – ~${Math.ceil((secondsNeeded - secondsDone) / 60)} min left (need 1+ in VC)`);
 
-    // ── PLAY_ACTIVITY ─────────────────────────────────────────────────────────
     } else if (taskName === "PLAY_ACTIVITY") {
         const channelId =
             ChannelStore.getSortedPrivateChannels()[0]?.id ??
@@ -449,7 +392,7 @@ function doJob(quest: any) {
             try {
                 log(`Activity: ${questName}`);
                 while (true) {
-                    const res = await api.post({
+                    const res = await RestAPI.post({
                         url: `/quests/${quest.id}/heartbeat`,
                         body: { stream_key: streamKey, terminal: false }
                     });
@@ -457,7 +400,7 @@ function doJob(quest: any) {
                     log(`[${questName}] Progress: ${progress}/${secondsNeeded}`);
 
                     if (progress >= secondsNeeded) {
-                        await api.post({
+                        await RestAPI.post({
                             url: `/quests/${quest.id}/heartbeat`,
                             body: { stream_key: streamKey, terminal: true }
                         });
@@ -475,7 +418,6 @@ function doJob(quest: any) {
     }
 }
 
-// ── Plugin entry point ────────────────────────────────────────────────────────
 export default definePlugin({
     name: "QuestAutoCompleterV2",
     description: "Automatically completes Discord quests. Supports auto-accept and spoofing game/stream/video progress.",
@@ -486,26 +428,7 @@ export default definePlugin({
         log("Starting...");
 
         try {
-            const bootstrapFlux = (): any => {
-                try {
-                    if (!(window as any).webpackChunkdiscord_app) return null;
-                    let wpRequire: any = null;
-                    (window as any).webpackChunkdiscord_app.push([[Symbol()], {}, (r: any) => { wpRequire = r; }]);
-                    (window as any).webpackChunkdiscord_app.pop();
-                    if (!wpRequire?.c) return null;
-                    return (
-                        Object.values(wpRequire.c).find((x: any) => x?.exports?.Z?.__proto__?.flushWaitQueue)?.exports?.Z ??
-                        Object.values(wpRequire.c).find((x: any) => x?.exports?.h?.__proto__?.flushWaitQueue)?.exports?.h ??
-                        Object.values(wpRequire.c).find((x: any) => x?.exports?.default?.__proto__?.flushWaitQueue)?.exports?.default
-                    );
-                } catch (err) {
-                    console.error("[QuestAutoCompleterV2] bootstrapFlux error:", err);
-                    return null;
-                }
-            };
-
-            const earlyFlux = bootstrapFlux();
-            if (earlyFlux) {
+            if (FluxDispatcher) {
                 const onConnectionOpen = () => {
                     log("CONNECTION_OPEN – starting new session...");
                     startSession();
@@ -516,12 +439,12 @@ export default definePlugin({
                     setTimeout(() => launchEligibleQuests(), 500);
                 };
 
-                earlyFlux.subscribe?.("CONNECTION_OPEN", onConnectionOpen);
-                earlyFlux.subscribe?.("QUEST_USER_STATUS_UPDATE", onStatusUpdate);
+                FluxDispatcher.subscribe?.("CONNECTION_OPEN", onConnectionOpen);
+                FluxDispatcher.subscribe?.("QUEST_USER_STATUS_UPDATE", onStatusUpdate);
 
                 fluxUnsubs = [
-                    () => earlyFlux.unsubscribe?.("CONNECTION_OPEN", onConnectionOpen),
-                    () => earlyFlux.unsubscribe?.("QUEST_USER_STATUS_UPDATE", onStatusUpdate),
+                    () => FluxDispatcher.unsubscribe?.("CONNECTION_OPEN", onConnectionOpen),
+                    () => FluxDispatcher.unsubscribe?.("QUEST_USER_STATUS_UPDATE", onStatusUpdate),
                 ];
             } else {
                 log("FluxDispatcher not ready yet during early start, session will start automatically.");
@@ -550,9 +473,8 @@ export default definePlugin({
             pollInterval = null;
         }
 
-        questQueue       = [];
+        questQueue = [];
         activeQuestIds.clear();
-        initialized      = false;
-        sessionStarting  = false;
+        sessionStarting = false;
     }
 });
