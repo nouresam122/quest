@@ -113,7 +113,7 @@ function initStores(): boolean {
                          modules.find((x: any) => x?.exports?.Z?.flushWaitQueue || x?.exports?.Z?.subscribe)?.exports?.Z ??
                          modules.find((x: any) => x?.exports?.default?.flushWaitQueue || x?.exports?.default?.subscribe)?.exports?.default;
 
-        api = modules.find((x: any) => x?.exports Bo?.get)?.exports Bo ??
+        api = modules.find((x: any) => x?.exports?.Bo?.get)?.exports?.Bo ??
               modules.find((x: any) => x?.exports?.tn?.get)?.exports?.tn ??
               modules.find((x: any) => x?.exports?.HTTP?.get)?.exports?.HTTP;
 
@@ -488,7 +488,6 @@ export default definePlugin({
     start() {
         log("Starting...");
 
-        // إعادة محاولة الربط بالـ Stores حتى يتسنى لديسكورد تحميل كافة الـ Chunks بالكامل
         initRetryInterval = setInterval(() => {
             if (initStores()) {
                 if (initRetryInterval) {
