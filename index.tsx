@@ -40,6 +40,9 @@ let pollInterval: ReturnType<typeof setInterval> | null = null;
 let fluxUnsubs: (() => void)[] = [];
 let sessionStarting = false;
 
+// Global stagger counter so video quests don't all post at the same second
+let videoStaggerIndex = 0;
+
 const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
 
 function log(...args: any[]) {
@@ -75,7 +78,7 @@ function storesReady(): boolean {
 }
 
 async function enrollQuest(quest: any): Promise<boolean> {
-    const name = quest.config.messages.questName;
+    const name = quest.config.messages?.questName ?? quest.id;
     const MAX_RETRIES = 3;
 
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
@@ -154,7 +157,7 @@ function launchQuest(quest: any) {
     if (activeQuestIds.has(quest.id)) return;
     if (isCompleted(quest) || !isCompletable(quest)) return;
     activeQuestIds.add(quest.id);
-    log(`Launching: ${quest.config.messages.questName}`);
+    log(`Launching: ${quest.config.messages?.questName ?? quest.id}`);
     doJob(quest);
 }
 
@@ -178,6 +181,7 @@ function startSession() {
 
     questQueue = [];
     activeQuestIds.clear();
+    videoStaggerIndex = 0;
 
     if (pollInterval !== null) {
         clearInterval(pollInterval);
@@ -208,74 +212,114 @@ function startSession() {
     });
 }
 
-function doJob(quest: any) {
-    // ── DEBUG ──────────────────────────────────────────────────────────────────
-    console.log("[QuestAutoCompleterV2][DEBUG] doJob called for quest id:", quest?.id);
-    console.log("[QuestAutoCompleterV2][DEBUG] quest.config keys:", Object.keys(quest?.config ?? {}));
-    console.log("[QuestAutoCompleterV2][DEBUG] taskConfig:", quest?.config?.taskConfig);
-    console.log("[QuestAutoCompleterV2][DEBUG] taskConfigV2:", quest?.config?.taskConfigV2);
-    console.log("[QuestAutoCompleterV2][DEBUG] userStatus:", quest?.userStatus);
-
-    try {
-        const pid           = Math.floor(Math.random() * 30000) + 1000;
-        const applicationId = quest.config.application?.id;
-        const applicationName = quest.config.application?.name;
-        const questName     = quest.config.messages?.questName ?? quest.config.application?.name ?? quest.id;
-        const taskConfig    = getTaskConfig(quest);
-
-        if (!taskConfig) {
-            console.error("[QuestAutoCompleterV2] taskConfig is null — full config:", quest.config);
-            activeQuestIds.delete(quest.id);
-            return;
+// ── Safe REST post with 429 retry ─────────────────────────────────────────────
+async function safePost(url: string, body: any, label: string): Promise<any> {
+    while (true) {
+        try {
+            const res = await RestAPI.post({ url, body });
+            if (res?.status === 429) {
+                const wait = ((res.body?.retry_after ?? 5) + 0.5) * 1000;
+                log(`[${label}] rate limited, retrying in ${Math.ceil(wait / 1000)}s...`);
+                await sleep(wait);
+                continue;
+            }
+            return res;
+        } catch (e: any) {
+            const status = e?.status ?? e?.res?.status ?? 0;
+            const body2 = e?.body ?? e?.res?.body ?? {};
+            if (status === 429) {
+                const wait = ((body2?.retry_after ?? 5) + 0.5) * 1000;
+                log(`[${label}] rate limited, retrying in ${Math.ceil(wait / 1000)}s...`);
+                await sleep(wait);
+                continue;
+            }
+            throw e;
         }
-        if (!taskConfig.tasks) {
-            console.error("[QuestAutoCompleterV2] taskConfig.tasks missing — taskConfig:", taskConfig);
+    }
+}
+
+function doJob(quest: any) {
+    try {
+        const taskConfig  = getTaskConfig(quest);
+        const questName   = quest.config.messages?.questName ?? quest.id;
+
+        if (!taskConfig?.tasks) {
+            console.error("[QuestAutoCompleterV2] No taskConfig.tasks for:", questName);
             activeQuestIds.delete(quest.id);
             return;
         }
 
         const taskName = SUPPORTED_TASKS.find(x => taskConfig.tasks[x] != null);
         if (!taskName) {
-            console.error("[QuestAutoCompleterV2] No supported task found. tasks keys:", Object.keys(taskConfig.tasks));
+            console.error("[QuestAutoCompleterV2] No supported task for:", questName,
+                "available keys:", Object.keys(taskConfig.tasks));
             activeQuestIds.delete(quest.id);
             return;
         }
 
-        const secondsNeeded = taskConfig.tasks[taskName].target;
+        const taskData      = taskConfig.tasks[taskName];
+        const secondsNeeded = taskData.target;
         let secondsDone     = quest.userStatus?.progress?.[taskName]?.value ?? 0;
+        const pid           = Math.floor(Math.random() * 30000) + 1000;
 
-        log(`doJob: quest="${questName}" task=${taskName} need=${secondsNeeded}s done=${secondsDone}s`);
+        // ── Application ID: new format stores it inside the task data ──────────
+        // quest.config.application no longer exists in taskConfigV2 quests.
+        const applicationId =
+            quest.config.application?.id ??
+            taskData.applicationId ??
+            taskData.application_id ??
+            taskData.appId;
 
+        const applicationName =
+            quest.config.application?.name ??
+            taskData.applicationName ??
+            questName;
+
+        log(`doJob: "${questName}" task=${taskName} need=${secondsNeeded}s done=${secondsDone}s appId=${applicationId}`);
+
+        // ── WATCH_VIDEO / WATCH_VIDEO_ON_MOBILE ───────────────────────────────
         if (taskName === "WATCH_VIDEO" || taskName === "WATCH_VIDEO_ON_MOBILE") {
-            const maxFuture = 10, speed = 7, interval = 1;
+            const speed    = 7;
+            const maxFuture = 10;
             const enrolledAt = new Date(quest.userStatus.enrolledAt).getTime();
             let completed = false;
 
+            // Stagger video quests: each one waits an extra 3s relative to the
+            // previous so they don't all POST at the exact same second → no 429.
+            const myStagger = videoStaggerIndex++ * 3000;
+
             (async () => {
                 try {
+                    if (myStagger > 0) await sleep(myStagger);
+
                     while (true) {
-                        const maxAllowed = Math.floor((Date.now() - enrolledAt) / 1000) + maxFuture;
-                        const diff = maxAllowed - secondsDone;
-                        const timestamp = secondsDone + speed;
+                        const elapsed    = Math.floor((Date.now() - enrolledAt) / 1000);
+                        const maxAllowed = elapsed + maxFuture;
+                        const diff       = maxAllowed - secondsDone;
+                        const timestamp  = secondsDone + speed;
 
                         if (diff >= speed) {
-                            const res = await RestAPI.post({
-                                url: `/quests/${quest.id}/video-progress`,
-                                body: { timestamp: Math.min(secondsNeeded, timestamp + Math.random()) }
-                            });
-                            completed = res.body.completed_at != null;
+                            const res = await safePost(
+                                `/quests/${quest.id}/video-progress`,
+                                { timestamp: Math.min(secondsNeeded, timestamp + Math.random()) },
+                                questName
+                            );
+                            completed   = res.body?.completed_at != null;
                             secondsDone = Math.min(secondsNeeded, timestamp);
+                            log(`[${questName}] Video progress: ${Math.round(secondsDone)}/${secondsNeeded}s`);
                         }
 
-                        if (timestamp >= secondsNeeded) break;
-                        await sleep(interval * 1000);
+                        if (secondsDone >= secondsNeeded) break;
+                        // 3s between posts per quest — spread across time
+                        await sleep(3000);
                     }
 
                     if (!completed) {
-                        await RestAPI.post({
-                            url: `/quests/${quest.id}/video-progress`,
-                            body: { timestamp: secondsNeeded }
-                        });
+                        await safePost(
+                            `/quests/${quest.id}/video-progress`,
+                            { timestamp: secondsNeeded },
+                            questName
+                        );
                     }
 
                     log(`Completed: ${questName}`);
@@ -285,11 +329,19 @@ function doJob(quest: any) {
                 activeQuestIds.delete(quest.id);
             })();
 
-            log(`Spoofing video: ${questName}`);
+            log(`Spoofing video: ${questName} (stagger ${myStagger / 1000}s)`);
 
+        // ── PLAY_ON_DESKTOP ───────────────────────────────────────────────────
         } else if (taskName === "PLAY_ON_DESKTOP") {
             if (!isApp) {
                 log(`${questName} requires the desktop app – skipping`);
+                activeQuestIds.delete(quest.id);
+                return;
+            }
+
+            if (!applicationId) {
+                console.error("[QuestAutoCompleterV2] Cannot find applicationId for PLAY_ON_DESKTOP quest:", questName,
+                    "\ntaskData:", taskData);
                 activeQuestIds.delete(quest.id);
                 return;
             }
@@ -341,7 +393,7 @@ function doJob(quest: any) {
                         try {
                             const progress = quest.config.configVersion === 1
                                 ? data.userStatus.streamProgressSeconds
-                                : Math.floor(data.userStatus.progress.PLAY_ON_DESKTOP.value);
+                                : Math.floor(data.userStatus.progress?.PLAY_ON_DESKTOP?.value ?? 0);
 
                             log(`[${questName}] Progress: ${progress}/${secondsNeeded}`);
 
@@ -358,13 +410,14 @@ function doJob(quest: any) {
                     };
 
                     FluxDispatcher.subscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", fn);
-                    log(`Spoofed game: ${applicationName} – ~${Math.ceil((secondsNeeded - secondsDone) / 60)} min left`);
+                    log(`Spoofed game: ${appData.name} – ~${Math.ceil((secondsNeeded - secondsDone) / 60)} min left`);
                 })
                 .catch((e: any) => {
                     log(`Failed to fetch app data for "${questName}":`, e);
                     activeQuestIds.delete(quest.id);
                 });
 
+        // ── STREAM_ON_DESKTOP ─────────────────────────────────────────────────
         } else if (taskName === "STREAM_ON_DESKTOP") {
             if (!isApp) {
                 log(`${questName} requires the desktop app – skipping`);
@@ -389,7 +442,7 @@ function doJob(quest: any) {
                 try {
                     const progress = quest.config.configVersion === 1
                         ? data.userStatus.streamProgressSeconds
-                        : Math.floor(data.userStatus.progress.STREAM_ON_DESKTOP.value);
+                        : Math.floor(data.userStatus.progress?.STREAM_ON_DESKTOP?.value ?? 0);
 
                     log(`[${questName}] Progress: ${progress}/${secondsNeeded}`);
 
@@ -408,6 +461,7 @@ function doJob(quest: any) {
             FluxDispatcher.subscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", fn);
             log(`Spoofed stream: ${applicationName} – ~${Math.ceil((secondsNeeded - secondsDone) / 60)} min left (need 1+ in VC)`);
 
+        // ── PLAY_ACTIVITY ─────────────────────────────────────────────────────
         } else if (taskName === "PLAY_ACTIVITY") {
             const channelId =
                 ChannelStore.getSortedPrivateChannels()[0]?.id ??
@@ -426,18 +480,20 @@ function doJob(quest: any) {
                 try {
                     log(`Activity: ${questName}`);
                     while (true) {
-                        const res = await RestAPI.post({
-                            url: `/quests/${quest.id}/heartbeat`,
-                            body: { stream_key: streamKey, terminal: false }
-                        });
-                        const progress = res.body.progress.PLAY_ACTIVITY.value;
+                        const res = await safePost(
+                            `/quests/${quest.id}/heartbeat`,
+                            { stream_key: streamKey, terminal: false },
+                            questName
+                        );
+                        const progress = res.body.progress?.PLAY_ACTIVITY?.value ?? 0;
                         log(`[${questName}] Progress: ${progress}/${secondsNeeded}`);
 
                         if (progress >= secondsNeeded) {
-                            await RestAPI.post({
-                                url: `/quests/${quest.id}/heartbeat`,
-                                body: { stream_key: streamKey, terminal: true }
-                            });
+                            await safePost(
+                                `/quests/${quest.id}/heartbeat`,
+                                { stream_key: streamKey, terminal: true },
+                                questName
+                            );
                             break;
                         }
 
@@ -452,7 +508,7 @@ function doJob(quest: any) {
         }
 
     } catch (outerErr: any) {
-        console.error("[QuestAutoCompleterV2] doJob crashed for quest", quest?.id, ":", outerErr);
+        console.error("[QuestAutoCompleterV2] doJob crashed:", outerErr);
         activeQuestIds.delete(quest?.id);
     }
 }
@@ -514,6 +570,7 @@ export default definePlugin({
 
         questQueue = [];
         activeQuestIds.clear();
+        videoStaggerIndex = 0;
         sessionStarting = false;
     }
 });
