@@ -136,7 +136,12 @@ async function autoAcceptAvailableQuests(): Promise<boolean> {
 
     for (const q of unaccepted) {
         const ok = await enrollQuest(q);
-        if (ok) enrolledAny = true;
+        if (ok) {
+            enrolledAny = true;
+            if (!q.userStatus) q.userStatus = {};
+            if (!q.userStatus.enrolledAt) q.userStatus.enrolledAt = new Date().toISOString();
+            launchQuest(q);
+        }
         await sleep(3000);
     }
 
@@ -145,24 +150,25 @@ async function autoAcceptAvailableQuests(): Promise<boolean> {
 
 const activeQuestIds = new Set<string>();
 
+function launchQuest(quest: any) {
+    if (activeQuestIds.has(quest.id)) return;
+    if (isCompleted(quest) || !isCompletable(quest)) return;
+    activeQuestIds.add(quest.id);
+    log(`Launching: ${quest.config.messages.questName}`);
+    doJob(quest);
+}
+
 function launchEligibleQuests() {
     if (!QuestStore?.quests) return;
     const enrolled = [...QuestStore.quests.values()].filter((q: any) =>
         isEnrolled(q) && !isCompleted(q) && isCompletable(q)
     );
-
-    for (const quest of enrolled) {
-        if (activeQuestIds.has(quest.id)) continue;
-        activeQuestIds.add(quest.id);
-        log(`Launching: ${quest.config.messages.questName}`);
-        doJob(quest);
-    }
+    for (const quest of enrolled) launchQuest(quest);
 }
 
 async function scan() {
     if (!storesReady()) return;
-    const newlyEnrolled = await autoAcceptAvailableQuests();
-    if (newlyEnrolled) await sleep(500);
+    await autoAcceptAvailableQuests();
     launchEligibleQuests();
 }
 
@@ -203,218 +209,251 @@ function startSession() {
 }
 
 function doJob(quest: any) {
-    const pid = Math.floor(Math.random() * 30000) + 1000;
-    const applicationId = quest.config.application.id;
-    const applicationName = quest.config.application.name;
-    const questName = quest.config.messages.questName;
-    const taskConfig = getTaskConfig(quest);
-    const taskName = SUPPORTED_TASKS.find(x => taskConfig.tasks[x] != null)!;
-    const secondsNeeded = taskConfig.tasks[taskName].target;
-    let secondsDone = quest.userStatus?.progress?.[taskName]?.value ?? 0;
+    // ── DEBUG ──────────────────────────────────────────────────────────────────
+    console.log("[QuestAutoCompleterV2][DEBUG] doJob called for quest id:", quest?.id);
+    console.log("[QuestAutoCompleterV2][DEBUG] quest.config keys:", Object.keys(quest?.config ?? {}));
+    console.log("[QuestAutoCompleterV2][DEBUG] taskConfig:", quest?.config?.taskConfig);
+    console.log("[QuestAutoCompleterV2][DEBUG] taskConfigV2:", quest?.config?.taskConfigV2);
+    console.log("[QuestAutoCompleterV2][DEBUG] userStatus:", quest?.userStatus);
 
-    if (taskName === "WATCH_VIDEO" || taskName === "WATCH_VIDEO_ON_MOBILE") {
-        const maxFuture = 10, speed = 7, interval = 1;
-        const enrolledAt = new Date(quest.userStatus.enrolledAt).getTime();
-        let completed = false;
+    try {
+        const pid           = Math.floor(Math.random() * 30000) + 1000;
+        const applicationId = quest.config.application?.id;
+        const applicationName = quest.config.application?.name;
+        const questName     = quest.config.messages?.questName ?? quest.config.application?.name ?? quest.id;
+        const taskConfig    = getTaskConfig(quest);
 
-        (async () => {
-            try {
-                while (true) {
-                    const maxAllowed = Math.floor((Date.now() - enrolledAt) / 1000) + maxFuture;
-                    const diff = maxAllowed - secondsDone;
-                    const timestamp = secondsDone + speed;
-
-                    if (diff >= speed) {
-                        const res = await RestAPI.post({
-                            url: `/quests/${quest.id}/video-progress`,
-                            body: { timestamp: Math.min(secondsNeeded, timestamp + Math.random()) }
-                        });
-                        completed = res.body.completed_at != null;
-                        secondsDone = Math.min(secondsNeeded, timestamp);
-                    }
-
-                    if (timestamp >= secondsNeeded) break;
-                    await sleep(interval * 1000);
-                }
-
-                if (!completed) {
-                    await RestAPI.post({
-                        url: `/quests/${quest.id}/video-progress`,
-                        body: { timestamp: secondsNeeded }
-                    });
-                }
-
-                log(`Completed: ${questName}`);
-            } catch (e) {
-                log(`Error completing "${questName}":`, e);
-            }
+        if (!taskConfig) {
+            console.error("[QuestAutoCompleterV2] taskConfig is null — full config:", quest.config);
             activeQuestIds.delete(quest.id);
-        })();
-
-        log(`Spoofing video: ${questName}`);
-
-    } else if (taskName === "PLAY_ON_DESKTOP") {
-        if (!isApp) {
-            log(`${questName} requires the desktop app – skipping`);
+            return;
+        }
+        if (!taskConfig.tasks) {
+            console.error("[QuestAutoCompleterV2] taskConfig.tasks missing — taskConfig:", taskConfig);
             activeQuestIds.delete(quest.id);
             return;
         }
 
-        RestAPI.get({ url: `/applications/public?application_ids=${applicationId}` })
-            .then((res: any) => {
-                const appData = res.body?.[0];
+        const taskName = SUPPORTED_TASKS.find(x => taskConfig.tasks[x] != null);
+        if (!taskName) {
+            console.error("[QuestAutoCompleterV2] No supported task found. tasks keys:", Object.keys(taskConfig.tasks));
+            activeQuestIds.delete(quest.id);
+            return;
+        }
 
-                if (!appData) {
-                    log(`No app data returned for "${questName}" – skipping`);
-                    activeQuestIds.delete(quest.id);
-                    return;
+        const secondsNeeded = taskConfig.tasks[taskName].target;
+        let secondsDone     = quest.userStatus?.progress?.[taskName]?.value ?? 0;
+
+        log(`doJob: quest="${questName}" task=${taskName} need=${secondsNeeded}s done=${secondsDone}s`);
+
+        if (taskName === "WATCH_VIDEO" || taskName === "WATCH_VIDEO_ON_MOBILE") {
+            const maxFuture = 10, speed = 7, interval = 1;
+            const enrolledAt = new Date(quest.userStatus.enrolledAt).getTime();
+            let completed = false;
+
+            (async () => {
+                try {
+                    while (true) {
+                        const maxAllowed = Math.floor((Date.now() - enrolledAt) / 1000) + maxFuture;
+                        const diff = maxAllowed - secondsDone;
+                        const timestamp = secondsDone + speed;
+
+                        if (diff >= speed) {
+                            const res = await RestAPI.post({
+                                url: `/quests/${quest.id}/video-progress`,
+                                body: { timestamp: Math.min(secondsNeeded, timestamp + Math.random()) }
+                            });
+                            completed = res.body.completed_at != null;
+                            secondsDone = Math.min(secondsNeeded, timestamp);
+                        }
+
+                        if (timestamp >= secondsNeeded) break;
+                        await sleep(interval * 1000);
+                    }
+
+                    if (!completed) {
+                        await RestAPI.post({
+                            url: `/quests/${quest.id}/video-progress`,
+                            body: { timestamp: secondsNeeded }
+                        });
+                    }
+
+                    log(`Completed: ${questName}`);
+                } catch (e) {
+                    log(`Error completing "${questName}":`, e);
                 }
+                activeQuestIds.delete(quest.id);
+            })();
 
-                const win32Exe = appData.executables?.find((x: any) => x.os === "win32");
-                const anyExe = appData.executables?.[0];
-                const exeName = (win32Exe ?? anyExe)?.name?.replace(">", "") ?? `${appData.name}.exe`;
+            log(`Spoofing video: ${questName}`);
 
-                const fakeGame = {
-                    cmdLine: `C:\\Program Files\\${appData.name}\\${exeName}`,
-                    exeName,
-                    exePath: `c:/program files/${appData.name.toLowerCase()}/${exeName}`,
-                    hidden: false,
-                    isLauncher: false,
-                    id: applicationId,
-                    name: appData.name,
-                    pid,
-                    pidPath: [pid],
-                    processName: appData.name,
-                    start: Date.now(),
-                };
+        } else if (taskName === "PLAY_ON_DESKTOP") {
+            if (!isApp) {
+                log(`${questName} requires the desktop app – skipping`);
+                activeQuestIds.delete(quest.id);
+                return;
+            }
 
-                const realGames = RunningGameStore.getRunningGames();
-                const realGetRunningGames = RunningGameStore.getRunningGames;
-                const realGetGameForPID = RunningGameStore.getGameForPID;
+            RestAPI.get({ url: `/applications/public?application_ids=${applicationId}` })
+                .then((res: any) => {
+                    const appData = res.body?.[0];
 
-                const cleanup = () => {
-                    RunningGameStore.getRunningGames = realGetRunningGames;
-                    RunningGameStore.getGameForPID = realGetGameForPID;
-                    FluxDispatcher.dispatch({ type: "RUNNING_GAMES_CHANGE", removed: [fakeGame], added: [], games: [] });
-                    FluxDispatcher.unsubscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", fn);
-                };
+                    if (!appData) {
+                        log(`No app data returned for "${questName}" – skipping`);
+                        activeQuestIds.delete(quest.id);
+                        return;
+                    }
 
-                RunningGameStore.getRunningGames = () => [fakeGame];
-                RunningGameStore.getGameForPID = (p: number) => (p === fakeGame.pid ? fakeGame : undefined);
-                FluxDispatcher.dispatch({ type: "RUNNING_GAMES_CHANGE", removed: realGames, added: [fakeGame], games: [fakeGame] });
+                    const win32Exe = appData.executables?.find((x: any) => x.os === "win32");
+                    const anyExe   = appData.executables?.[0];
+                    const exeName  = (win32Exe ?? anyExe)?.name?.replace(">", "") ?? `${appData.name}.exe`;
 
-                const fn = (data: any) => {
-                    try {
-                        const progress = quest.config.configVersion === 1
-                            ? data.userStatus.streamProgressSeconds
-                            : Math.floor(data.userStatus.progress.PLAY_ON_DESKTOP.value);
+                    const fakeGame = {
+                        cmdLine: `C:\\Program Files\\${appData.name}\\${exeName}`,
+                        exeName,
+                        exePath: `c:/program files/${appData.name.toLowerCase()}/${exeName}`,
+                        hidden: false,
+                        isLauncher: false,
+                        id: applicationId,
+                        name: appData.name,
+                        pid,
+                        pidPath: [pid],
+                        processName: appData.name,
+                        start: Date.now(),
+                    };
 
-                        log(`[${questName}] Progress: ${progress}/${secondsNeeded}`);
+                    const realGames           = RunningGameStore.getRunningGames();
+                    const realGetRunningGames = RunningGameStore.getRunningGames;
+                    const realGetGameForPID   = RunningGameStore.getGameForPID;
 
-                        if (progress >= secondsNeeded) {
-                            log(`Completed: ${questName}`);
+                    const cleanup = () => {
+                        RunningGameStore.getRunningGames = realGetRunningGames;
+                        RunningGameStore.getGameForPID   = realGetGameForPID;
+                        FluxDispatcher.dispatch({ type: "RUNNING_GAMES_CHANGE", removed: [fakeGame], added: [], games: [] });
+                        FluxDispatcher.unsubscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", fn);
+                    };
+
+                    RunningGameStore.getRunningGames = () => [fakeGame];
+                    RunningGameStore.getGameForPID   = (p: number) => (p === fakeGame.pid ? fakeGame : undefined);
+                    FluxDispatcher.dispatch({ type: "RUNNING_GAMES_CHANGE", removed: realGames, added: [fakeGame], games: [fakeGame] });
+
+                    const fn = (data: any) => {
+                        try {
+                            const progress = quest.config.configVersion === 1
+                                ? data.userStatus.streamProgressSeconds
+                                : Math.floor(data.userStatus.progress.PLAY_ON_DESKTOP.value);
+
+                            log(`[${questName}] Progress: ${progress}/${secondsNeeded}`);
+
+                            if (progress >= secondsNeeded) {
+                                log(`Completed: ${questName}`);
+                                cleanup();
+                                activeQuestIds.delete(quest.id);
+                            }
+                        } catch (e) {
+                            log(`Error in heartbeat handler for "${questName}":`, e);
                             cleanup();
                             activeQuestIds.delete(quest.id);
                         }
-                    } catch (e) {
-                        log(`Error in heartbeat handler for "${questName}":`, e);
-                        cleanup();
-                        activeQuestIds.delete(quest.id);
-                    }
-                };
+                    };
 
-                FluxDispatcher.subscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", fn);
-                log(`Spoofed game: ${applicationName} – ~${Math.ceil((secondsNeeded - secondsDone) / 60)} min left`);
-            })
-            .catch((e: any) => {
-                log(`Failed to fetch app data for "${questName}":`, e);
+                    FluxDispatcher.subscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", fn);
+                    log(`Spoofed game: ${applicationName} – ~${Math.ceil((secondsNeeded - secondsDone) / 60)} min left`);
+                })
+                .catch((e: any) => {
+                    log(`Failed to fetch app data for "${questName}":`, e);
+                    activeQuestIds.delete(quest.id);
+                });
+
+        } else if (taskName === "STREAM_ON_DESKTOP") {
+            if (!isApp) {
+                log(`${questName} requires the desktop app – skipping`);
                 activeQuestIds.delete(quest.id);
+                return;
+            }
+
+            const realFunc = ApplicationStreamingStore.getStreamerActiveStreamMetadata;
+
+            const cleanup = () => {
+                ApplicationStreamingStore.getStreamerActiveStreamMetadata = realFunc;
+                FluxDispatcher.unsubscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", fn);
+            };
+
+            ApplicationStreamingStore.getStreamerActiveStreamMetadata = () => ({
+                id: applicationId,
+                pid,
+                sourceName: null
             });
 
-    } else if (taskName === "STREAM_ON_DESKTOP") {
-        if (!isApp) {
-            log(`${questName} requires the desktop app – skipping`);
-            activeQuestIds.delete(quest.id);
-            return;
-        }
+            const fn = (data: any) => {
+                try {
+                    const progress = quest.config.configVersion === 1
+                        ? data.userStatus.streamProgressSeconds
+                        : Math.floor(data.userStatus.progress.STREAM_ON_DESKTOP.value);
 
-        const realFunc = ApplicationStreamingStore.getStreamerActiveStreamMetadata;
-
-        const cleanup = () => {
-            ApplicationStreamingStore.getStreamerActiveStreamMetadata = realFunc;
-            FluxDispatcher.unsubscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", fn);
-        };
-
-        ApplicationStreamingStore.getStreamerActiveStreamMetadata = () => ({
-            id: applicationId,
-            pid,
-            sourceName: null
-        });
-
-        const fn = (data: any) => {
-            try {
-                const progress = quest.config.configVersion === 1
-                    ? data.userStatus.streamProgressSeconds
-                    : Math.floor(data.userStatus.progress.STREAM_ON_DESKTOP.value);
-
-                log(`[${questName}] Progress: ${progress}/${secondsNeeded}`);
-
-                if (progress >= secondsNeeded) {
-                    log(`Completed: ${questName}`);
-                    cleanup();
-                    activeQuestIds.delete(quest.id);
-                }
-            } catch (e) {
-                log(`Error in heartbeat handler for "${questName}":`, e);
-                cleanup();
-                activeQuestIds.delete(quest.id);
-            }
-        };
-
-        FluxDispatcher.subscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", fn);
-        log(`Spoofed stream: ${applicationName} – ~${Math.ceil((secondsNeeded - secondsDone) / 60)} min left (need 1+ in VC)`);
-
-    } else if (taskName === "PLAY_ACTIVITY") {
-        const channelId =
-            ChannelStore.getSortedPrivateChannels()[0]?.id ??
-            (Object.values(GuildChannelStore.getAllGuilds()) as any[])
-                .find((x: any) => x?.VOCAL?.length > 0)?.VOCAL[0]?.channel?.id;
-
-        if (!channelId) {
-            log("No suitable channel found for PLAY_ACTIVITY – skipping");
-            activeQuestIds.delete(quest.id);
-            return;
-        }
-
-        const streamKey = `call:${channelId}:1`;
-
-        (async () => {
-            try {
-                log(`Activity: ${questName}`);
-                while (true) {
-                    const res = await RestAPI.post({
-                        url: `/quests/${quest.id}/heartbeat`,
-                        body: { stream_key: streamKey, terminal: false }
-                    });
-                    const progress = res.body.progress.PLAY_ACTIVITY.value;
                     log(`[${questName}] Progress: ${progress}/${secondsNeeded}`);
 
                     if (progress >= secondsNeeded) {
-                        await RestAPI.post({
-                            url: `/quests/${quest.id}/heartbeat`,
-                            body: { stream_key: streamKey, terminal: true }
-                        });
-                        break;
+                        log(`Completed: ${questName}`);
+                        cleanup();
+                        activeQuestIds.delete(quest.id);
                     }
-
-                    await sleep(20000);
+                } catch (e) {
+                    log(`Error in heartbeat handler for "${questName}":`, e);
+                    cleanup();
+                    activeQuestIds.delete(quest.id);
                 }
-                log(`Completed: ${questName}`);
-            } catch (e) {
-                log(`Error completing "${questName}":`, e);
+            };
+
+            FluxDispatcher.subscribe("QUESTS_SEND_HEARTBEAT_SUCCESS", fn);
+            log(`Spoofed stream: ${applicationName} – ~${Math.ceil((secondsNeeded - secondsDone) / 60)} min left (need 1+ in VC)`);
+
+        } else if (taskName === "PLAY_ACTIVITY") {
+            const channelId =
+                ChannelStore.getSortedPrivateChannels()[0]?.id ??
+                (Object.values(GuildChannelStore.getAllGuilds()) as any[])
+                    .find((x: any) => x?.VOCAL?.length > 0)?.VOCAL[0]?.channel?.id;
+
+            if (!channelId) {
+                log("No suitable channel found for PLAY_ACTIVITY – skipping");
+                activeQuestIds.delete(quest.id);
+                return;
             }
-            activeQuestIds.delete(quest.id);
-        })();
+
+            const streamKey = `call:${channelId}:1`;
+
+            (async () => {
+                try {
+                    log(`Activity: ${questName}`);
+                    while (true) {
+                        const res = await RestAPI.post({
+                            url: `/quests/${quest.id}/heartbeat`,
+                            body: { stream_key: streamKey, terminal: false }
+                        });
+                        const progress = res.body.progress.PLAY_ACTIVITY.value;
+                        log(`[${questName}] Progress: ${progress}/${secondsNeeded}`);
+
+                        if (progress >= secondsNeeded) {
+                            await RestAPI.post({
+                                url: `/quests/${quest.id}/heartbeat`,
+                                body: { stream_key: streamKey, terminal: true }
+                            });
+                            break;
+                        }
+
+                        await sleep(20000);
+                    }
+                    log(`Completed: ${questName}`);
+                } catch (e) {
+                    log(`Error completing "${questName}":`, e);
+                }
+                activeQuestIds.delete(quest.id);
+            })();
+        }
+
+    } catch (outerErr: any) {
+        console.error("[QuestAutoCompleterV2] doJob crashed for quest", quest?.id, ":", outerErr);
+        activeQuestIds.delete(quest?.id);
     }
 }
 
