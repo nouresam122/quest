@@ -39,8 +39,6 @@ let questQueue: any[] = [];
 let pollInterval: ReturnType<typeof setInterval> | null = null;
 let fluxUnsubs: (() => void)[] = [];
 let sessionStarting = false;
-
-// Global stagger counter so video quests don't all post at the same second
 let videoStaggerIndex = 0;
 
 const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
@@ -212,7 +210,6 @@ function startSession() {
     });
 }
 
-// ── Safe REST post with 429 retry ─────────────────────────────────────────────
 async function safePost(url: string, body: any, label: string): Promise<any> {
     while (true) {
         try {
@@ -240,8 +237,8 @@ async function safePost(url: string, body: any, label: string): Promise<any> {
 
 function doJob(quest: any) {
     try {
-        const taskConfig  = getTaskConfig(quest);
-        const questName   = quest.config.messages?.questName ?? quest.id;
+        const taskConfig = getTaskConfig(quest);
+        const questName  = quest.config.messages?.questName ?? quest.id;
 
         if (!taskConfig?.tasks) {
             console.error("[QuestAutoCompleterV2] No taskConfig.tasks for:", questName);
@@ -262,30 +259,29 @@ function doJob(quest: any) {
         let secondsDone     = quest.userStatus?.progress?.[taskName]?.value ?? 0;
         const pid           = Math.floor(Math.random() * 30000) + 1000;
 
-        // ── Application ID: new format stores it inside the task data ──────────
-        // quest.config.application no longer exists in taskConfigV2 quests.
+        // ── FIX: new Discord format stores applicationId inside applications[]
+        // taskData = { type, target, applications: [ { id, name, ... } ] }
         const applicationId =
             quest.config.application?.id ??
             taskData.applicationId ??
             taskData.application_id ??
-            taskData.appId;
+            taskData.applications?.[0]?.id ??
+            taskData.applications?.[0];
 
         const applicationName =
             quest.config.application?.name ??
             taskData.applicationName ??
+            taskData.applications?.[0]?.name ??
             questName;
 
         log(`doJob: "${questName}" task=${taskName} need=${secondsNeeded}s done=${secondsDone}s appId=${applicationId}`);
 
         // ── WATCH_VIDEO / WATCH_VIDEO_ON_MOBILE ───────────────────────────────
         if (taskName === "WATCH_VIDEO" || taskName === "WATCH_VIDEO_ON_MOBILE") {
-            const speed    = 7;
+            const speed     = 7;
             const maxFuture = 10;
             const enrolledAt = new Date(quest.userStatus.enrolledAt).getTime();
             let completed = false;
-
-            // Stagger video quests: each one waits an extra 3s relative to the
-            // previous so they don't all POST at the exact same second → no 429.
             const myStagger = videoStaggerIndex++ * 3000;
 
             (async () => {
@@ -306,11 +302,10 @@ function doJob(quest: any) {
                             );
                             completed   = res.body?.completed_at != null;
                             secondsDone = Math.min(secondsNeeded, timestamp);
-                            log(`[${questName}] Video progress: ${Math.round(secondsDone)}/${secondsNeeded}s`);
+                            log(`[${questName}] Video: ${Math.round(secondsDone)}/${secondsNeeded}s`);
                         }
 
                         if (secondsDone >= secondsNeeded) break;
-                        // 3s between posts per quest — spread across time
                         await sleep(3000);
                     }
 
@@ -340,8 +335,7 @@ function doJob(quest: any) {
             }
 
             if (!applicationId) {
-                console.error("[QuestAutoCompleterV2] Cannot find applicationId for PLAY_ON_DESKTOP quest:", questName,
-                    "\ntaskData:", taskData);
+                console.error("[QuestAutoCompleterV2] Cannot find applicationId for:", questName, "\ntaskData:", taskData);
                 activeQuestIds.delete(quest.id);
                 return;
             }
