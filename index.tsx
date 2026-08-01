@@ -1,5 +1,5 @@
 /*
- * Vencord / Equicord, a Discord client mod
+ * Vencord, a Discord client mod
  * Copyright (c) 2024 Vendicated and contributors
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
@@ -38,7 +38,6 @@ let isApp: boolean;
 let initialized = false;
 let questQueue: any[] = [];
 let pollInterval: ReturnType<typeof setInterval> | null = null;
-let initRetryInterval: ReturnType<typeof setInterval> | null = null;
 let fluxUnsubs: (() => void)[] = [];
 let sessionStarting = false;
 
@@ -75,55 +74,53 @@ function initStores(): boolean {
     if (initialized) return true;
 
     try {
-        const wp = (window as any).webpackChunkdiscord_app;
-        if (!wp) return false;
-
+        if (!(window as any).webpackChunkdiscord_app) return false;
         let wpRequire: any = null;
-        wp.push([[Symbol()], {}, (r: any) => { wpRequire = r; }]);
-        wp.pop();
+        (window as any).webpackChunkdiscord_app.push([[Symbol()], {}, (r: any) => { wpRequire = r; }]);
+        (window as any).webpackChunkdiscord_app.pop();
 
         if (!wpRequire?.c) return false;
 
         const modules = Object.values(wpRequire.c);
 
         ApplicationStreamingStore = modules.find((x: any) =>
-            x?.exports?.Z?.getStreamerActiveStreamMetadata ||
-            x?.exports?.default?.getStreamerActiveStreamMetadata ||
-            x?.exports?.A?.getStreamerActiveStreamMetadata
+            x?.exports?.Z?.__proto__?.getStreamerActiveStreamMetadata ||
+            x?.exports?.default?.__proto__?.getStreamerActiveStreamMetadata
         )?.exports?.Z ?? modules.find((x: any) =>
-            x?.exports?.A?.getStreamerActiveStreamMetadata
+            x?.exports?.A?.__proto__?.getStreamerActiveStreamMetadata
         )?.exports?.A;
 
         RunningGameStore = modules.find((x: any) => x?.exports?.Ay?.getRunningGames)?.exports?.Ay ??
                            modules.find((x: any) => x?.exports?.ZP?.getRunningGames)?.exports?.ZP ??
                            modules.find((x: any) => x?.exports?.Z?.getRunningGames)?.exports?.Z;
 
-        QuestsStore = modules.find((x: any) => x?.exports?.A?.getQuest || x?.exports?.A?.quests)?.exports?.A ??
-                      modules.find((x: any) => x?.exports?.Z?.getQuest || x?.exports?.Z?.quests)?.exports?.Z ??
-                      modules.find((x: any) => x?.exports?.default?.getQuest || x?.exports?.default?.quests)?.exports?.default;
+        QuestsStore = modules.find((x: any) => x?.exports?.A?.__proto__?.getQuest)?.exports?.A ??
+                      modules.find((x: any) => x?.exports?.Z?.__proto__?.getQuest)?.exports?.Z ??
+                      modules.find((x: any) => x?.exports?.default?.__proto__?.getQuest)?.exports?.default;
 
-        ChannelStore = modules.find((x: any) => x?.exports?.A?.getAllThreadsForParent)?.exports?.A ??
-                       modules.find((x: any) => x?.exports?.Z?.getAllThreadsForParent)?.exports?.Z ??
-                       modules.find((x: any) => x?.exports?.default?.getAllThreadsForParent)?.exports?.default;
+        ChannelStore = modules.find((x: any) => x?.exports?.A?.__proto__?.getAllThreadsForParent)?.exports?.A ??
+                       modules.find((x: any) => x?.exports?.Z?.__proto__?.getAllThreadsForParent)?.exports?.Z ??
+                       modules.find((x: any) => x?.exports?.default?.__proto__?.getAllThreadsForParent)?.exports?.default;
 
         GuildChannelStore = modules.find((x: any) => x?.exports?.Ay?.getSFWDefaultChannel)?.exports?.Ay ??
                             modules.find((x: any) => x?.exports?.ZP?.getSFWDefaultChannel)?.exports?.ZP;
 
-        FluxDispatcher = modules.find((x: any) => x?.exports?.h?.flushWaitQueue || x?.exports?.h?.subscribe)?.exports?.h ??
-                         modules.find((x: any) => x?.exports?.Z?.flushWaitQueue || x?.exports?.Z?.subscribe)?.exports?.Z ??
-                         modules.find((x: any) => x?.exports?.default?.flushWaitQueue || x?.exports?.default?.subscribe)?.exports?.default;
+        FluxDispatcher = modules.find((x: any) => x?.exports?.h?.__proto__?.flushWaitQueue)?.exports?.h ??
+                         modules.find((x: any) => x?.exports?.Z?.__proto__?.flushWaitQueue)?.exports?.Z ??
+                         modules.find((x: any) => x?.exports?.default?.__proto__?.flushWaitQueue)?.exports?.default;
 
         api = modules.find((x: any) => x?.exports?.Bo?.get)?.exports?.Bo ??
               modules.find((x: any) => x?.exports?.tn?.get)?.exports?.tn ??
               modules.find((x: any) => x?.exports?.HTTP?.get)?.exports?.HTTP;
 
         if (!QuestsStore || !FluxDispatcher || !api) {
+            console.error("[QuestAutoCompleterV2] Failed to find required stores");
             return false;
         }
 
         isApp = typeof (window as any).DiscordNative !== "undefined";
         initialized = true;
-        log("Stores initialized successfully, isApp =", isApp);
+        log("Stores initialized, isApp =", isApp);
         return true;
     } catch (e) {
         console.error("[QuestAutoCompleterV2] Init failed:", e);
@@ -488,45 +485,56 @@ export default definePlugin({
     start() {
         log("Starting...");
 
-        initRetryInterval = setInterval(() => {
-            if (initStores()) {
-                if (initRetryInterval) {
-                    clearInterval(initRetryInterval);
-                    initRetryInterval = null;
+        try {
+            const bootstrapFlux = (): any => {
+                try {
+                    if (!(window as any).webpackChunkdiscord_app) return null;
+                    let wpRequire: any = null;
+                    (window as any).webpackChunkdiscord_app.push([[Symbol()], {}, (r: any) => { wpRequire = r; }]);
+                    (window as any).webpackChunkdiscord_app.pop();
+                    if (!wpRequire?.c) return null;
+                    return (
+                        Object.values(wpRequire.c).find((x: any) => x?.exports?.Z?.__proto__?.flushWaitQueue)?.exports?.Z ??
+                        Object.values(wpRequire.c).find((x: any) => x?.exports?.h?.__proto__?.flushWaitQueue)?.exports?.h ??
+                        Object.values(wpRequire.c).find((x: any) => x?.exports?.default?.__proto__?.flushWaitQueue)?.exports?.default
+                    );
+                } catch (err) {
+                    console.error("[QuestAutoCompleterV2] bootstrapFlux error:", err);
+                    return null;
                 }
+            };
 
-                if (FluxDispatcher) {
-                    const onConnectionOpen = () => {
-                        log("CONNECTION_OPEN – starting new session...");
-                        startSession();
-                    };
+            const earlyFlux = bootstrapFlux();
+            if (earlyFlux) {
+                const onConnectionOpen = () => {
+                    log("CONNECTION_OPEN – starting new session...");
+                    startSession();
+                };
 
-                    const onStatusUpdate = () => {
-                        log("QUEST_USER_STATUS_UPDATE – checking quests...");
-                        setTimeout(() => launchEligibleQuests(), 500);
-                    };
+                const onStatusUpdate = () => {
+                    log("QUEST_USER_STATUS_UPDATE – checking quests...");
+                    setTimeout(() => launchEligibleQuests(), 500);
+                };
 
-                    FluxDispatcher.subscribe?.("CONNECTION_OPEN", onConnectionOpen);
-                    FluxDispatcher.subscribe?.("QUEST_USER_STATUS_UPDATE", onStatusUpdate);
+                earlyFlux.subscribe?.("CONNECTION_OPEN", onConnectionOpen);
+                earlyFlux.subscribe?.("QUEST_USER_STATUS_UPDATE", onStatusUpdate);
 
-                    fluxUnsubs = [
-                        () => FluxDispatcher.unsubscribe?.("CONNECTION_OPEN", onConnectionOpen),
-                        () => FluxDispatcher.unsubscribe?.("QUEST_USER_STATUS_UPDATE", onStatusUpdate),
-                    ];
-                }
-
-                startSession();
+                fluxUnsubs = [
+                    () => earlyFlux.unsubscribe?.("CONNECTION_OPEN", onConnectionOpen),
+                    () => earlyFlux.unsubscribe?.("QUEST_USER_STATUS_UPDATE", onStatusUpdate),
+                ];
+            } else {
+                log("FluxDispatcher not ready yet during early start, session will start automatically.");
             }
-        }, 1000);
+
+            startSession();
+        } catch (e) {
+            console.error("[QuestAutoCompleterV2] Error starting plugin:", e);
+        }
     },
 
     stop() {
         log("Stopping...");
-
-        if (initRetryInterval !== null) {
-            clearInterval(initRetryInterval);
-            initRetryInterval = null;
-        }
 
         try {
             for (const unsub of fluxUnsubs) {
