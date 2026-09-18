@@ -22,7 +22,7 @@ const settings = definePluginSettings({
     autoAcceptQuests: {
         type: OptionType.BOOLEAN,
         description: "Automatically accept all available quests",
-        default: false,
+        default: true,
         restartNeeded: false
     },
     logProgress: {
@@ -183,7 +183,23 @@ function launchEligibleQuests() {
 
 async function scan() {
     if (!storesReady()) return;
-    await autoAcceptAvailableQuests();
+
+    if (QuestStore?.quests) {
+        const all = [...QuestStore.quests.values()];
+        const enrolled  = all.filter((q: any) => isEnrolled(q) && !isCompleted(q) && isCompletable(q));
+        const available = all.filter((q: any) => !isEnrolled(q) && !isCompleted(q) && isCompletable(q));
+        const completed = all.filter((q: any) => isCompleted(q));
+        log(`Quest summary: ${all.length} total | ${enrolled.length} enrolled/active | ${available.length} available (not accepted) | ${completed.length} completed`);
+    }
+
+    const accepted = await autoAcceptAvailableQuests();
+
+    // Re-check after accepting so newly enrolled quests launch immediately (no need to wait 60s)
+    if (accepted) {
+        log("Quests accepted – waiting 3s for store update then launching...");
+        await sleep(3000);
+    }
+
     launchEligibleQuests();
 }
 
